@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2025
+ * Copyright (C) 2026 Yuzhii0718
  *
- * Author: Yuzhii
+ * All rights reserved.
+ *
+ * This file is part of the project uboot-mt7621-dhcpd
+ * You may not use, copy, modify or distribute this file except in compliance with the license agreement.
  *
  * Minimal DHCPv4 server for MediaTek web failsafe.
  *
@@ -51,28 +54,29 @@ struct dhcpd_pkt {
 #define HTYPE_ETHER		1
 #define HLEN_ETHER		6
 
-#define DHCPDISCOVER		1
+#define DHCPDISCOVER	1
 #define DHCPOFFER		2
 #define DHCPREQUEST		3
+#define DHCPNAK			6
 #define DHCPACK			5
 
-#define DHCP_OPTION_PAD		0
+#define DHCP_OPTION_PAD			0
 #define DHCP_OPTION_SUBNET_MASK	1
-#define DHCP_OPTION_ROUTER	3
+#define DHCP_OPTION_ROUTER		3
 #define DHCP_OPTION_DNS_SERVER	6
 #define DHCP_OPTION_REQ_IPADDR	50
 #define DHCP_OPTION_LEASE_TIME	51
 #define DHCP_OPTION_MSG_TYPE	53
 #define DHCP_OPTION_SERVER_ID	54
-#define DHCP_OPTION_END		255
+#define DHCP_OPTION_MESSAGE		56
+#define DHCP_OPTION_END			255
 
-#define DHCP_FLAG_BROADCAST	0x8000
-
-#define DHCPD_POOL_START_STR	"192.168.1.100"
-#define DHCPD_POOL_END_STR	"192.168.1.200"
+#define DHCP_FLAG_BROADCAST		0x8000
 
 #define DHCPD_DEFAULT_IP_STR	"192.168.1.1"
 #define DHCPD_DEFAULT_NETMASK_STR "255.255.255.0"
+#define DHCPD_DEFAULT_POOL_START_HOST	100
+#define DHCPD_DEFAULT_POOL_SIZE		101
 
 #define DHCPD_MAX_CLIENTS	8
 
@@ -92,18 +96,26 @@ static bool dhcpd_running;
 
 static struct in_addr dhcpd_get_server_ip(void)
 {
+#ifdef CONFIG_MTK_DHCPD_USE_CONFIG_IP
+	return string_to_ip(CONFIG_IPADDR);
+#else
 	if (net_ip.s_addr)
 		return net_ip;
 
 	return string_to_ip(DHCPD_DEFAULT_IP_STR);
+#endif
 }
 
 static struct in_addr dhcpd_get_netmask(void)
 {
+#ifdef CONFIG_MTK_DHCPD_USE_CONFIG_IP
+	return string_to_ip(CONFIG_NETMASK);
+#else
 	if (net_netmask.s_addr)
 		return net_netmask;
 
 	return string_to_ip(DHCPD_DEFAULT_NETMASK_STR);
+#endif
 }
 
 static struct in_addr dhcpd_get_gateway(void)
@@ -120,6 +132,56 @@ static struct in_addr dhcpd_get_dns(void)
 		return net_dns_server;
 
 	return dhcpd_get_server_ip();
+}
+
+static u32 dhcpd_get_pool_start_host(void)
+{
+#ifdef CONFIG_MTK_DHCPD_USE_CONFIG_IP
+	return (u32)CONFIG_MTK_DHCPD_POOL_START_HOST;
+#else
+	return DHCPD_DEFAULT_POOL_START_HOST;
+#endif
+}
+
+static u32 dhcpd_get_pool_size(void)
+{
+#ifdef CONFIG_MTK_DHCPD_USE_CONFIG_IP
+	return (u32)CONFIG_MTK_DHCPD_POOL_SIZE;
+#else
+	return DHCPD_DEFAULT_POOL_SIZE;
+#endif
+}
+
+static void dhcpd_get_pool_range(u32 *start, u32 *end)
+{
+	struct in_addr server_ip = dhcpd_get_server_ip();
+	struct in_addr netmask = dhcpd_get_netmask();
+	u32 ip_host = ntohl(server_ip.s_addr);
+	u32 mask = ntohl(netmask.s_addr);
+	u32 host_mask = ~mask;
+	u32 host_start = dhcpd_get_pool_start_host();
+	u32 size = dhcpd_get_pool_size();
+	u32 net = ip_host & mask;
+	u32 s, e, max_host;
+
+	if (!size)
+		size = 1;
+
+	max_host = host_mask;
+	host_start &= host_mask;
+	if (host_start == 0)
+		host_start = 1;
+
+	s = net | host_start;
+	e = s + size - 1;
+
+	if ((e & mask) != net || e > (net | max_host))
+		e = net | max_host;
+
+	if (start)
+		*start = s;
+	if (end)
+		*end = e;
 }
 
 static bool dhcpd_mac_equal(const u8 *a, const u8 *b)
@@ -141,25 +203,87 @@ static struct dhcpd_lease *dhcpd_find_lease(const u8 *mac)
 
 static bool dhcpd_ip_in_pool(u32 ip_host)
 {
-	u32 start = ntohl(string_to_ip(DHCPD_POOL_START_STR).s_addr);
-	u32 end = ntohl(string_to_ip(DHCPD_POOL_END_STR).s_addr);
+	u32 start, end;
+
+	dhcpd_get_pool_range(&start, &end);
 
 	return ip_host >= start && ip_host <= end;
 }
+
+#ifdef CONFIG_MTK_DHCPD_ENHANCED
+static bool dhcpd_ip_is_allocated(u32 ip_host)
+{
+	int i;
+
+	for (i = 0; i < DHCPD_MAX_CLIENTS; i++) {
+		if (!leases[i].used)
+			continue;
+		if (ntohl(leases[i].ip.s_addr) == ip_host)
+			return true;
+	}
+
+	return false;
+}
+
+static bool dhcpd_ip_allocated_to_mac(u32 ip_host, const u8 *mac)
+{
+	int i;
+
+	for (i = 0; i < DHCPD_MAX_CLIENTS; i++) {
+		if (!leases[i].used)
+			continue;
+		if (ntohl(leases[i].ip.s_addr) != ip_host)
+			continue;
+		return dhcpd_mac_equal(leases[i].mac, mac);
+	}
+
+	return false;
+}
+
+static u32 dhcpd_mac_hash(const u8 *mac)
+{
+	u32 h = 2166136261u;
+	int i;
+
+	for (i = 0; i < 6; i++) {
+		h ^= mac[i];
+		h *= 16777619u;
+	}
+
+	return h;
+}
+#endif
 
 static struct in_addr dhcpd_alloc_ip(const u8 *mac)
 {
 	struct dhcpd_lease *l;
 	u32 start, end;
 	int i;
+	struct in_addr ip;
+	u32 pool_size;
 
 	l = dhcpd_find_lease(mac);
-	if (l)
+	if (l && dhcpd_ip_in_pool(ntohl(l->ip.s_addr)))
 		return l->ip;
 
-	start = ntohl(string_to_ip(DHCPD_POOL_START_STR).s_addr);
-	end = ntohl(string_to_ip(DHCPD_POOL_END_STR).s_addr);
+	dhcpd_get_pool_range(&start, &end);
 
+	pool_size = end >= start ? (end - start + 1) : 0;
+
+#ifdef CONFIG_MTK_DHCPD_ENHANCED
+	if (pool_size) {
+		u32 hash = dhcpd_mac_hash(mac);
+		u32 off = hash % pool_size;
+
+		for (i = 0; i < (int)pool_size; i++) {
+			u32 cand = start + ((off + i) % pool_size);
+			if (!dhcpd_ip_is_allocated(cand)) {
+				ip.s_addr = htonl(cand);
+				return ip;
+			}
+		}
+	}
+#else
 	if (!next_ip_host)
 		next_ip_host = start;
 
@@ -179,13 +303,11 @@ static struct in_addr dhcpd_alloc_ip(const u8 *mac)
 			return leases[idx].ip;
 		}
 	}
+#endif
 
 	/* No free slot: just return the first address in pool */
-	{
-		struct in_addr ip;
-		ip.s_addr = htonl(start);
-		return ip;
-	}
+	ip.s_addr = htonl(start);
+	return ip;
 }
 
 static u8 dhcpd_parse_msg_type(const struct dhcpd_pkt *bp, unsigned int len)
@@ -289,6 +411,91 @@ static bool dhcpd_parse_req_ip(const struct dhcpd_pkt *bp, unsigned int len,
 	return false;
 }
 
+#ifdef CONFIG_MTK_DHCPD_ENHANCED
+static bool dhcpd_parse_server_id(const struct dhcpd_pkt *bp, unsigned int len,
+			      struct in_addr *server_ip)
+{
+	unsigned int fixed = offsetof(struct dhcpd_pkt, vend);
+	const u8 *opt;
+	unsigned int optlen;
+
+	if (len < fixed + 4)
+		return false;
+
+	opt = (const u8 *)bp->vend;
+	optlen = len - fixed;
+
+	if (memcmp(opt, dhcp_magic_cookie, sizeof(dhcp_magic_cookie)))
+		return false;
+
+	opt += 4;
+	optlen -= 4;
+
+	while (optlen) {
+		u8 code;
+		u8 olen;
+
+		code = *opt++;
+		optlen--;
+
+		if (code == DHCP_OPTION_PAD)
+			continue;
+		if (code == DHCP_OPTION_END)
+			break;
+
+		if (!optlen)
+			break;
+		olen = *opt++;
+		optlen--;
+
+		if (olen > optlen)
+			break;
+
+		if (code == DHCP_OPTION_SERVER_ID && olen == 4) {
+			memcpy(&server_ip->s_addr, opt, 4);
+			return true;
+		}
+
+		opt += olen;
+		optlen -= olen;
+	}
+
+	return false;
+}
+
+static void dhcpd_process_lease(const u8 *mac, struct in_addr ip)
+{
+	struct dhcpd_lease *l;
+	int i;
+
+	l = dhcpd_find_lease(mac);
+	if (l) {
+		l->ip = ip;
+		return;
+	}
+
+	for (i = 0; i < DHCPD_MAX_CLIENTS; i++) {
+		if (!leases[i].used) {
+			leases[i].used = true;
+			memcpy(leases[i].mac, mac, 6);
+			leases[i].ip = ip;
+			return;
+		}
+	}
+
+	/* Fallback: replace the first entry */
+	leases[0].used = true;
+	memcpy(leases[0].mac, mac, 6);
+	leases[0].ip = ip;
+}
+
+static bool dhcpd_same_subnet(struct in_addr a, struct in_addr b,
+			      struct in_addr mask)
+{
+	return (a.s_addr & mask.s_addr) == (b.s_addr & mask.s_addr);
+}
+#endif
+
 static u8 *dhcpd_opt_add_u8(u8 *p, u8 code, u8 val)
 {
 	*p++ = code;
@@ -311,7 +518,8 @@ static u8 *dhcpd_opt_add_inaddr(u8 *p, u8 code, struct in_addr addr)
 }
 
 static int dhcpd_send_reply(const struct dhcpd_pkt *req, unsigned int req_len,
-			    u8 dhcp_msg_type, struct in_addr yiaddr)
+			    u8 dhcp_msg_type, struct in_addr yiaddr,
+			    const char *nak_message)
 {
 	struct dhcpd_pkt *bp;
 	struct in_addr server_ip, netmask, gw, dns;
@@ -360,12 +568,23 @@ static int dhcpd_send_reply(const struct dhcpd_pkt *req, unsigned int req_len,
 
 	opt = dhcpd_opt_add_u8(opt, DHCP_OPTION_MSG_TYPE, dhcp_msg_type);
 	opt = dhcpd_opt_add_inaddr(opt, DHCP_OPTION_SERVER_ID, server_ip);
-	opt = dhcpd_opt_add_inaddr(opt, DHCP_OPTION_SUBNET_MASK, netmask);
-	opt = dhcpd_opt_add_inaddr(opt, DHCP_OPTION_ROUTER, gw);
-	opt = dhcpd_opt_add_inaddr(opt, DHCP_OPTION_DNS_SERVER, dns);
 
-	lease = htonl(3600);
-	opt = dhcpd_opt_add_u32(opt, DHCP_OPTION_LEASE_TIME, lease);
+	if (dhcp_msg_type != DHCPNAK) {
+		opt = dhcpd_opt_add_inaddr(opt, DHCP_OPTION_SUBNET_MASK, netmask);
+		opt = dhcpd_opt_add_inaddr(opt, DHCP_OPTION_ROUTER, gw);
+		opt = dhcpd_opt_add_inaddr(opt, DHCP_OPTION_DNS_SERVER, dns);
+
+		lease = htonl(3600);
+		opt = dhcpd_opt_add_u32(opt, DHCP_OPTION_LEASE_TIME, lease);
+	} else if (nak_message && *nak_message) {
+		size_t msg_len = strlen(nak_message);
+		u8 len = msg_len > 240 ? 240 : (u8)msg_len;
+
+		*opt++ = DHCP_OPTION_MESSAGE;
+		*opt++ = len;
+		memcpy(opt, nak_message, len);
+		opt += len;
+	}
 
 	*opt++ = DHCP_OPTION_END;
 
@@ -418,9 +637,53 @@ static void dhcpd_handle_packet(uchar *pkt, unsigned int dport,
 	case DHCPDISCOVER:
 		yiaddr = dhcpd_alloc_ip(bp->chaddr);
 		debug_cond(DEBUG_DEV_PKT, "dhcpd: offer %pI4\n", &yiaddr);
-		dhcpd_send_reply(bp, len, DHCPOFFER, yiaddr);
+		dhcpd_send_reply(bp, len, DHCPOFFER, yiaddr, NULL);
 		break;
 	case DHCPREQUEST:
+
+#ifdef CONFIG_MTK_DHCPD_ENHANCED
+		{
+			struct in_addr server_id;
+			struct in_addr server_ip = dhcpd_get_server_ip();
+			struct in_addr netmask = dhcpd_get_netmask();
+			bool has_server_id;
+			bool has_req_ip;
+			u32 ip_host;
+			struct in_addr zero_ip;
+
+			zero_ip.s_addr = 0;
+			has_server_id = dhcpd_parse_server_id(bp, len, &server_id);
+			if (has_server_id && server_id.s_addr != server_ip.s_addr)
+				return;
+
+			has_req_ip = dhcpd_parse_req_ip(bp, len, &req_ip);
+			if (!has_req_ip) {
+				yiaddr = dhcpd_alloc_ip(bp->chaddr);
+				dhcpd_process_lease(bp->chaddr, yiaddr);
+				dhcpd_send_reply(bp, len, DHCPACK, yiaddr, NULL);
+				break;
+			}
+
+			ip_host = ntohl(req_ip.s_addr);
+			if (!dhcpd_same_subnet(req_ip, server_ip, netmask)) {
+				dhcpd_send_reply(bp, len, DHCPNAK, zero_ip, "bad subnet");
+				break;
+			}
+			if (!dhcpd_ip_in_pool(ip_host)) {
+				dhcpd_send_reply(bp, len, DHCPNAK, zero_ip, "outside pool");
+				break;
+			}
+			if (dhcpd_ip_is_allocated(ip_host) &&
+			    !dhcpd_ip_allocated_to_mac(ip_host, bp->chaddr)) {
+				dhcpd_send_reply(bp, len, DHCPNAK, zero_ip, "in use");
+				break;
+			}
+
+			yiaddr = req_ip;
+			dhcpd_process_lease(bp->chaddr, yiaddr);
+			dhcpd_send_reply(bp, len, DHCPACK, yiaddr, NULL);
+		}
+#else
 		/* If client requests a specific IP, validate it */
 		if (dhcpd_parse_req_ip(bp, len, &req_ip)) {
 			u32 ip_host = ntohl(req_ip.s_addr);
@@ -432,7 +695,8 @@ static void dhcpd_handle_packet(uchar *pkt, unsigned int dport,
 		} else {
 			yiaddr = dhcpd_alloc_ip(bp->chaddr);
 		}
-		dhcpd_send_reply(bp, len, DHCPACK, yiaddr);
+		dhcpd_send_reply(bp, len, DHCPACK, yiaddr, NULL);
+#endif
 		break;
 	default:
 		break;
@@ -452,6 +716,7 @@ static void dhcpd_udp_handler(uchar *pkt, unsigned int dport,
 int mtk_dhcpd_start(void)
 {
 	struct in_addr pool_start;
+	u32 pool_start_host, pool_end_host;
 
 	/*
 	 * Be robust against net_init()/net_clear_handlers() resetting handlers.
@@ -469,9 +734,9 @@ int mtk_dhcpd_start(void)
 
 	/* Ensure we have a usable local IP, otherwise UDP replies will use 0.0.0.0 */
 	if (!net_ip.s_addr)
-		net_ip = string_to_ip(DHCPD_DEFAULT_IP_STR);
+		net_ip = dhcpd_get_server_ip();
 	if (!net_netmask.s_addr)
-		net_netmask = string_to_ip(DHCPD_DEFAULT_NETMASK_STR);
+		net_netmask = dhcpd_get_netmask();
 	if (!net_gateway.s_addr)
 		net_gateway = net_ip;
 	if (!net_dns_server.s_addr)
@@ -479,7 +744,8 @@ int mtk_dhcpd_start(void)
 
 	memset(leases, 0, sizeof(leases));
 
-	pool_start = string_to_ip(DHCPD_POOL_START_STR);
+	dhcpd_get_pool_range(&pool_start_host, &pool_end_host);
+	pool_start.s_addr = htonl(pool_start_host);
 	next_ip_host = ntohl(pool_start.s_addr);
 
 	prev_udp_handler = net_get_udp_handler();
