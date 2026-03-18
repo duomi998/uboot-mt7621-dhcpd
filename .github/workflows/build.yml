@@ -8,6 +8,25 @@ on:
         required: true
         type: string
         default: 'zte_e8820s'
+      warninginfo:
+        description: '警告信息：
+            这些来自自动化迁移的配置文件[configs-mt7621](https://github.com/Yuzhii0718/uboot-mt7621-dhcpd/tree/main/configs-mt7621)**并不可信**，
+            编译之前请**务必检查**它们是否适合你的设备！
+            在使用之前请查看 [README](https://github.com/Yuzhii0718/uboot-mt7621-dhcpd/blob/main/README.md)!
+            否则**有变砖的风险，自行承担**！'
+        required: false
+        type: boolean
+        default: false
+      warning:
+        description: '我已阅读 README 以及警告信息，并自行承担风险！'
+        required: true
+        type: boolean
+        default: false
+      confirm:
+        description: '我没有确认警告信息，只是闭眼选中了所有的复选框，请关闭这个工作流！'
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -17,6 +36,18 @@ jobs:
        fail-fast: False
 
     steps:
+      - name: make sure the user has confirmed the warning
+        if: ${{ !inputs.warning || !inputs.warninginfo }}
+        run: |
+          echo "Please confirm the warning before running this workflow."
+          exit 1
+
+      - name: make sure the user has confirmed the warning info not being trustworthy
+        if: ${{ inputs.confirm }}
+        run: |
+          echo "Please confirm that you have read the warning info before running this workflow."
+          exit 1
+
       - name: Checkout master directory
         uses: actions/checkout@v4
         with:
